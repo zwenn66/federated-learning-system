@@ -1,0 +1,11 @@
+# 联邦学习系统依赖清单（Python 3.11 / Windows）
+# 安装：python -m pip install -r requirements.txt
+# 说明：版本按与项目代码 API 兼容性锁定，勿随意升级大版本
+
+flwr==1.9.0                # Flower 联邦学习框架（与 federated_server/client 的 API 匹配）
+tensorflow==2.16.2         # 深度学习框架（CNN 模型）
+numpy<2.0                  # TensorFlow 2.16 兼容要求
+matplotlib>=3.5.0          # GUI 训练曲线绘制
+pillow>=9.0.0              # 图像处理（GUI 图标等）
+ttkbootstrap==2.2.6        # GUI 现代扁平主题扩展（tkinter 版）
+PySide6>=6.7               # 专业版 GUI 框架（Qt，federated_gui_pyside.py）

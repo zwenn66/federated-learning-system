@@ -1,0 +1,26 @@
+{
+  "server": {
+    "address": "0.0.0.0",
+    "port": 8080,
+    "min_clients": 2,
+    "num_rounds": 20,
+    "fraction_fit": 0.5,
+    "fraction_evaluate": 0.5,
+    "save_interval": 5,
+    "model_save_path": "./saved_models"
+  },
+  "client": {
+    "local_epochs": 1,
+    "batch_size": 32,
+    "learning_rate": 0.01,
+    "max_retries": 5,
+    "retry_delay": 5
+  },
+  "model": {
+    "architecture": "cnn",
+    "input_shape": [28, 28, 1],
+    "num_classes": 10,
+    "optimizer": "adam",
+    "loss": "sparse_categorical_crossentropy"
+  }
+}

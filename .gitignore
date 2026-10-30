@@ -1,0 +1,30 @@
+# 虚拟环境
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+
+# 训练产物（模型文件、日志，均为运行生成，不纳入版本管理）
+saved_models/
+*.h5
+*.keras
+server.log
+fl_log_*.txt
+client_logs/
+.gui.lock
+_pyside_stderr.log
+.pytest_cache/
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# 运行时配置（含端口等本机环境信息，如需共享请复制为示例模板）
+server_config_gui.json
+server_config.json
+gui_config.json
+
+# 临时文件
+*.tmp
+~$*
