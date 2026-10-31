@@ -93,9 +93,12 @@ def non_iid_split(x: np.ndarray, y: np.ndarray, client_id: str, num_clients: int
 class FederatedClient(fl.client.NumPyClient):
     """符合Flower规范的联邦学习客户端类（仅定义一次）"""
 
-    def __init__(self, client_id: str, num_clients: int):
+    def __init__(self, client_id: str, num_clients: int,
+                 malicious: str = 'none', scale: float = 50.0):
         self.client_id = client_id
         self.num_clients = num_clients
+        self.malicious = malicious          # 'none' / 'scale'
+        self.scale = float(scale)           # 缩放攻击放大倍数
         # 加载本地Non-IID数据和全局测试集
         (self.x_train, self.y_train), (self.x_test, self.y_test) = load_fashion_mnist(client_id, num_clients)
         # 初始化CNN模型（与服务器端保持一致）
@@ -125,6 +128,8 @@ class FederatedClient(fl.client.NumPyClient):
 
     def fit(self, parameters, config):
         """本地训练：使用Non-IID数据更新模型"""
+        # 记录攻击前的全局基准权重（缩放攻击放大的是"更新增量"）
+        base_weights = [np.asarray(p, dtype=np.float32) for p in parameters]
         self.model.set_weights(parameters)
         # 从配置中获取本地训练轮数（由服务器指定）
         local_epochs = config.get('local_epochs', 1)
@@ -138,9 +143,18 @@ class FederatedClient(fl.client.NumPyClient):
         # 记录本地训练指标（供 GUI 客户端状态页显示）
         train_acc = float(history.history['accuracy'][-1])
         _log_local_metric(self.client_id, "fit", len(self.x_train), train_acc)
+
+        new_weights = self.model.get_weights()
+        if self.malicious == 'scale':
+            # 缩放攻击（scale attack）：把本地更新增量放大 self.scale 倍再上传，
+            # 模拟恶意客户端试图用超大梯度带偏全局聚合
+            new_weights = [
+                base + self.scale * (np.asarray(new_w, dtype=np.float32) - base)
+                for base, new_w in zip(base_weights, new_weights)
+            ]
         # 返回更新后的参数、样本数、训练指标
         return (
-            self.model.get_weights(),
+            new_weights,
             len(self.x_train),
             {
                 "train_loss": float(history.history['loss'][-1]),
@@ -163,12 +177,17 @@ if __name__ == "__main__":
     parser.add_argument('--cid', required=True, help='客户端ID，格式：client_1、client_2等')
     parser.add_argument('--server', required=True, help='服务器地址，如127.0.0.1:8080')
     parser.add_argument('--num-clients', type=int, default=3, help='客户端总数（用于Non-IID划分）')
+    parser.add_argument('--malicious', default='none', choices=['none', 'scale'],
+                        help='恶意攻击模式：none=诚实客户端 / scale=缩放攻击（放大本地更新增量）')
+    parser.add_argument('--scale', type=float, default=50.0, help='缩放攻击放大倍数（默认50，仅 --malicious scale 生效）')
     args = parser.parse_args()
 
     # 初始化客户端并连接服务器
     try:
-        client = FederatedClient(args.cid, args.num_clients)
-        print(f"\n客户端 {args.cid} 启动成功，连接服务器：{args.server}")
+        client = FederatedClient(args.cid, args.num_clients,
+                                 malicious=args.malicious, scale=args.scale)
+        print(f"\n客户端 {args.cid} 启动成功，连接服务器：{args.server}"
+              + (f"（恶意模式：{args.malicious}，放大 {args.scale} 倍）" if args.malicious != 'none' else ""))
         fl.client.start_numpy_client(
             server_address=args.server,
             client=client,
@@ -177,3 +196,4 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"客户端启动失败：{str(e)}")
         exit(1)
+
