@@ -13,6 +13,7 @@
 ## 功能特性
 
 - **Non-IID 数据划分**：每个客户端按 `client_id` 分配专属类别样本（每客户端 2 类），模拟真实"数据孤岛"场景
+- **安全对抗实验（网安 × AI）**：支持恶意客户端缩放攻击注入（`--malicious scale`），服务器可选 **Trimmed Mean / Krum 鲁棒聚合防御**（`--defense`），配套量化对比实验脚本验证防御有效性
 - **FedAvg 聚合**：服务器端实现标准联邦平均策略，支持分数采样（fraction_fit / fraction_evaluate）
 - **统一 CNN 架构**：服务器与客户端使用一致模型（Conv2D×2 + Dense×2）
 - **PySide6 专业版 GUI**（`federated_gui_pyside.py`）：
@@ -103,8 +104,8 @@ python federated_client.py --cid client_2 --server 127.0.0.1:8080 --num-clients 
 federated-learning-system/
 ├── federated_gui_pyside.py   # PySide6 专业版 GUI（主推，10 页导航）
 ├── federated_gui.py          # Tkinter 版 GUI（ttkbootstrap 主题）
-├── federated_server.py       # Flower 服务器：FedAvg + 全局模型 + 指标日志
-├── federated_client.py       # Flower 客户端：Non-IID 划分 + 本地 CNN 训练
+├── federated_server.py       # Flower 服务器：FedAvg + 鲁棒聚合防御（Trimmed Mean/Krum）+ 指标日志
+├── federated_client.py       # Flower 客户端：Non-IID 划分 + 本地 CNN 训练 + 可选恶意攻击模式
 ├── run_all.py                # 一键启动器（进程管理）
 ├── main.py                   # 依赖安装脚本（阿里云镜像）
 ├── fix_chinese_font.py       # matplotlib 中文乱码修复
@@ -137,6 +138,7 @@ federated-learning-system/
 | `verify_charts.py` | 图表逻辑（真实数据重绘 / 重置后无残留曲线） |
 | `verify_session_boundary.py` | 会话边界（二次训练 ROUND 重新从 1 开始，丢弃上一会话指标） |
 | `verify_full_e2e.py` | 综合端到端：真实 server + 2 客户端完整训练 + 模型落盘 + 二次会话边界（11 项断言） |
+| `verify_poison_defense.py` | 安全对抗实验：缩放攻击（×50）× 恶意占比 0/20%/40% × 防御开/关，量化对比 + 算法自检 + 5 组断言 |
 | `check_log.py` | server.log 结构与指标解析检查 |
 
 运行全部验证：
@@ -157,8 +159,67 @@ federated-learning-system/
 | 训练收敛 | train_acc 87.5% → 93.4%（第 3 轮峰值） |
 | 泛化趋势 | test_acc 17.5% → 19.6%（逐轮上升） |
 | 全局模型保存 | 每 `save_interval` 轮自动保存 `.h5` 成功 |
+| 安全对抗（恶意 20%，5 客户端 5 轮） | 攻击后 test_acc 0.299 → 0.100（崩溃）；Trimmed Mean 防御恢复至 0.302（与基线持平） |
+| 安全对抗（恶意 40%） | 无防御崩溃（0.100）；单参数 Trimmed Mean 不足以完全恢复（防御边界，见下） |
 
 > test_acc 偏低属预期：Non-IID 强划分（每客户端仅 2 类）+ 低轮数 + CPU 单 epoch。提高轮数（如 20 轮）或放宽类别划分（每客户端 3–4 类）可显著提升。
+
+## 安全对抗实验（模型投毒 · 缩放攻击 vs 鲁棒聚合）
+
+### 攻击模型：缩放攻击（Scale Attack）
+
+恶意客户端在本地训练后，把"更新增量"放大 `--scale` 倍再上传（默认 50 倍）：
+
+```
+update = 本地训练后权重 - 全局基准权重        # 正常客户端上传的增量
+恶意客户端上传: base + scale × update        # 放大 50 倍的梯度增量
+```
+
+放大后的恶意更新在 FedAvg 平均聚合中占比 20%–40%，即可把全局模型一步带偏到随机水平（test_acc 崩溃至 ≈10%）。
+
+### 防御：鲁棒聚合（Trimmed Mean / Krum）
+
+服务器端自定义 Flower strategy（`LoggingFedAvg.aggregate_fit` 覆写），聚合前先剔除离群更新：
+
+- **Trimmed Mean**（`--defense trimmed_mean --trim-fraction 0.2`）：对每个权重坐标，去掉最大 / 最小各 `k` 个客户端的值再平均，从坐标级剔除被放大的恶意更新
+- **Krum**（`--defense krum --num-malicious 1`）：计算每个更新与其余更新的欧氏距离，选择与最近的 `n-f-2` 个更新距离平方和最小的那个（离群恶意更新得分必然偏高而被排除）
+
+### 命令行用法
+
+```powershell
+# 服务器开启防御（防御参数也支持写入 --config 配置文件 / GUI 配置）
+python federated_server.py --port 8080 --num-rounds 5 --min-clients 5 --defense trimmed_mean
+
+# 恶意客户端（正常客户端不加 --malicious）
+python federated_client.py --cid client_1 --server 127.0.0.1:8080 --num-clients 5 --malicious scale --scale 50
+```
+
+### 量化实验结果（5 客户端 × 5 轮 × Non-IID 2 类，缩放 ×50）
+
+| 轮次 | 基线（无恶意） | 攻击 20% | 防御 20% | 攻击 40% | 防御 40% |
+| --- | --- | --- | --- | --- | --- |
+| R1 | 0.1067 | 0.1818 | 0.1951 | 0.1791 | 0.1003 |
+| R2 | 0.2348 | 0.1000 | 0.1022 | 0.1135 | 0.1852 |
+| R3 | 0.2563 | 0.1000 | 0.2727 | 0.1000 | 0.1130 |
+| R4 | 0.3803 | 0.1000 | 0.2377 | 0.1000 | 0.1002 |
+| **R5（末轮）** | **0.2986** | **0.1000** | **0.3019** | **0.1000** | **0.1000** |
+
+结论：
+
+- **恶意 20%**：无防御时 FedAvg 崩溃（0.299 → 0.100，回到随机水平）；Trimmed Mean 防御后完全恢复（0.302，与基线持平甚至略高）
+- **恶意 40%**：无防御同样崩溃；Trimmed Mean 单参数裁剪（每端 20% 只裁 1 个）不足以剔除全部恶意更新——恶意占比接近 50% 时"多数诚实"假设失效，任何鲁棒聚合都受限（Krum 理论条件 `n ≥ 2f+3` 也不再满足）
+
+> **防御边界（真实的局限，面试加分点）**：鲁棒聚合的有效窗口是"恶意客户端 < 50%"。
+> 恶意占比越高，需要的裁剪比例 / 客户端总数越大；恶意过半时需引入可信执行环境、模型验证
+> 或联邦审计等更强假设。本项目实验如实呈现该边界，不夸大防御能力。
+
+复现实验：
+
+```powershell
+.\\.venv\\Scripts\\python scripts\\verify_poison_defense.py
+```
+
+脚本自动完成：算法级自检（纯函数验证聚合函数恢复能力）→ 5 组真实训练实验 → 断言（攻击显著拉低 / 防御显著恢复 / 代价可控）→ 现场还原（配置 / 日志 / 模型 / 客户端日志）。
 
 ## 开发历程与硬核 Bug 修复（Git 提交史精选）
 
