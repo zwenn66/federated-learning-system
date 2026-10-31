@@ -128,25 +128,140 @@ class RobustFedServer:
         return weighted_metrics
 
 
+def trimmed_mean_aggregate(ndarrays_list, trim_fraction: float = 0.2):
+    """坐标级 Trimmed Mean 鲁棒聚合
+
+    对每个权重张量的每个坐标：去掉最大 / 最小各 k 个客户端的值后求平均，
+    从而剔除被放大的恶意更新（缩放攻击）对聚合结果的带偏。
+    客户端数 < 3 时退化为普通平均（鲁棒聚合需要足够的样本量）。
+
+    - ndarrays_list: List[List[np.ndarray]]，每个元素是一个客户端的完整权重列表
+    - trim_fraction: 每端裁剪比例，k = round(n * trim_fraction)
+    """
+    n = len(ndarrays_list)
+    n_layers = len(ndarrays_list[0])
+    if n < 3:
+        return [np.mean([np.asarray(w[i], dtype=np.float32) for w in ndarrays_list], axis=0)
+                for i in range(n_layers)]
+
+    k = max(1, int(round(n * trim_fraction))) if trim_fraction > 0 else 0
+    # 保证裁剪后至少保留 2 个客户端
+    if 2 * k >= n:
+        k = n // 2 - 1 if n % 2 == 0 else n // 2
+        k = max(1, k)
+
+    agg = []
+    for i in range(n_layers):
+        layer_weights = [np.asarray(w[i], dtype=np.float32) for w in ndarrays_list]
+        if layer_weights[0].ndim == 0:
+            arr = np.array(layer_weights)
+            arr.sort()
+            agg.append(arr[k:-k].mean() if 2 * k < len(arr) else arr.mean())
+        else:
+            flat = np.stack([lw.reshape(-1) for lw in layer_weights])  # (n, dim)
+            sorted_f = np.sort(flat, axis=0)
+            trimmed = sorted_f[k:-k] if 2 * k < n else sorted_f
+            agg.append(trimmed.mean(axis=0).reshape(layer_weights[0].shape))
+    return agg
+
+
+def krum_aggregate(ndarrays_list, num_malicious: int = 1):
+    """Krum 鲁棒聚合：选择与其余更新最"一致"的单个客户端更新
+
+    原版（Blanchard et al. 2017）：对每个更新，取它与最近的 n-f-2 个其他更新的
+    欧氏距离平方和作为得分，得分最小的更新即被选中（多数诚实假设下，离群的
+    恶意更新得分必然偏高而被排除）。本实现直接返回被选中客户端的完整权重。
+
+    注：单点 Krum 仅输出一个客户端的更新，不损失后续聚合的简单性；
+    当恶意客户端占比过高（≥50%）时"多数诚实"假设失效，防御同样失效。
+    """
+    n = len(ndarrays_list)
+    if n < 3:
+        return [np.mean([np.asarray(w[i], dtype=np.float32) for w in ndarrays_list], axis=0)
+                for i in range(len(ndarrays_list[0]))]
+    f = max(0, min(int(num_malicious), n - 2))
+
+    flat = [np.concatenate([np.asarray(w, dtype=np.float32).reshape(-1)
+                            for w in cw]) for cw in ndarrays_list]
+    dist = np.zeros((n, n))
+    for i in range(n):
+        for j in range(i + 1, n):
+            d = float(np.linalg.norm(flat[i] - flat[j]))
+            dist[i, j] = dist[j, i] = d
+
+    keep = max(1, n - f - 2)  # 与最近的 n-f-2 个更新比较
+    scores = []
+    for i in range(n):
+        others = sorted(dist[i, j] ** 2 for j in range(n) if j != i)
+        scores.append(sum(others[:keep]))
+    best = int(np.argmin(scores))
+    return ndarrays_list[best]
+
+
 class LoggingFedAvg(FedAvg):
-    """带指标日志 + 定时保存的 FedAvg 策略
+    """带指标日志 + 定时保存 + 可选鲁棒聚合的 FedAvg 策略
 
     - 每轮训练/评估后将聚合指标写入 server.log（供 GUI 解析真实训练曲线）
     - 每 save_interval 轮保存一次全局模型到 saved_models/
+    - defense='trimmed_mean' / 'krum' 时，聚合前先对客户端更新做鲁棒聚合，
+      抵御缩放 / 投毒类恶意客户端；defense='none' 保持标准 FedAvg 行为
+    - 聚合后把真实全局权重写回 server_instance.global_model，
+      确保保存的 .h5 是聚合后的全局模型（而非初始随机模型）
     """
 
     def __init__(self, server_instance: Optional[RobustFedServer] = None,
-                 save_interval: int = 5, *args, **kwargs):
+                 save_interval: int = 5, defense: str = 'none',
+                 trim_fraction: float = 0.2, num_malicious: int = 1,
+                 *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._server_instance = server_instance
         self._save_interval = max(1, save_interval)
+        self._defense = defense
+        self._trim_fraction = trim_fraction
+        self._num_malicious = num_malicious
 
     def aggregate_fit(self, server_round: int, results, failures):
+        if not results:
+            return None
+        if self._defense in ('trimmed_mean', 'krum'):
+            # ---- 鲁棒聚合路径：先防御，再聚合指标 ----
+            ndarrays_list = [fl.common.parameters_to_ndarrays(fit_res.parameters)
+                             for _, fit_res in results]
+            if self._defense == 'trimmed_mean':
+                agg_ndarrays = trimmed_mean_aggregate(ndarrays_list, self._trim_fraction)
+            else:
+                agg_ndarrays = krum_aggregate(ndarrays_list, self._num_malicious)
+            agg_params = fl.common.ndarrays_to_parameters(agg_ndarrays)
+
+            weights_results = [(fit_res.num_examples, fit_res.metrics)
+                               for _, fit_res in results]
+            metrics_agg = (self.fit_metrics_aggregation_fn(weights_results)
+                           if self.fit_metrics_aggregation_fn else None)
+
+            if self._server_instance:
+                try:
+                    self._server_instance.global_model.set_weights(agg_ndarrays)
+                except Exception as e:
+                    logger.warning(f"全局模型权重回写失败: {e}")
+            if metrics_agg:
+                logger.info(f"[ROUND {server_round}] FitMetrics = {metrics_agg}")
+            if self._server_instance and server_round % self._save_interval == 0:
+                self._server_instance.save_global_model(server_round)
+            return agg_params, metrics_agg
+
+        # ---- 标准 FedAvg 路径 ----
         aggregated = super().aggregate_fit(server_round, results, failures)
         if aggregated is not None:
-            _, metrics = aggregated
+            params, metrics = aggregated
             if metrics:
                 logger.info(f"[ROUND {server_round}] FitMetrics = {metrics}")
+            # 回写真实全局权重，保证保存的模型是聚合结果
+            if self._server_instance:
+                try:
+                    self._server_instance.global_model.set_weights(
+                        fl.common.parameters_to_ndarrays(params))
+                except Exception as e:
+                    logger.warning(f"全局模型权重回写失败: {e}")
             # 按配置间隔保存全局模型
             if self._server_instance and server_round % self._save_interval == 0:
                 self._server_instance.save_global_model(server_round)
@@ -171,6 +286,9 @@ def create_strategy(server_instance: RobustFedServer, config: Dict) -> FedAvg:
     strategy = LoggingFedAvg(
         server_instance=server_instance,
         save_interval=config.get('save_interval', 5),
+        defense=config.get('defense', 'none'),
+        trim_fraction=config.get('trim_fraction', 0.2),
+        num_malicious=config.get('num_malicious', 1),
         fraction_fit=config.get('fraction_fit', 0.5),
         fraction_evaluate=config.get('fraction_evaluate', 0.5),
         min_fit_clients=config.get('min_fit_clients', 2),
@@ -273,6 +391,10 @@ def main():
     parser.add_argument('--min-clients', type=int, default=None, help='最小客户端数（覆盖配置）')
     parser.add_argument('--local-epochs', type=int, default=None, help='本地训练轮数（覆盖配置）')
     parser.add_argument('--model-save-path', default=None, help='模型保存路径（覆盖配置）')
+    parser.add_argument('--defense', default=None, choices=['none', 'trimmed_mean', 'krum'],
+                        help='鲁棒聚合防御：none=标准FedAvg / trimmed_mean=坐标裁剪平均 / krum=单点选择（覆盖配置）')
+    parser.add_argument('--trim-fraction', type=float, default=None, help='Trimmed Mean 每端裁剪比例（默认0.2）')
+    parser.add_argument('--num-malicious', type=int, default=None, help='Krum 假设的恶意客户端数（默认1）')
     args = parser.parse_args()
 
     # 服务器配置（默认值）
@@ -289,7 +411,10 @@ def main():
         'learning_rate': 0.01,
         'model_save_path': './saved_models',
         'save_interval': 5,
-        'round_timeout': 600
+        'round_timeout': 600,
+        'defense': 'none',
+        'trim_fraction': 0.2,
+        'num_malicious': 1
     }
 
     # 若指定配置文件，以配置文件覆盖默认值
@@ -316,6 +441,12 @@ def main():
         config['local_epochs'] = args.local_epochs
     if args.model_save_path is not None:
         config['model_save_path'] = args.model_save_path
+    if args.defense is not None:
+        config['defense'] = args.defense
+    if args.trim_fraction is not None:
+        config['trim_fraction'] = args.trim_fraction
+    if args.num_malicious is not None:
+        config['num_malicious'] = args.num_malicious
 
     # 启动服务器
     success, message = start_server(config)
